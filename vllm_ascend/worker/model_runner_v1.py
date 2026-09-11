@@ -2809,12 +2809,26 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self.input_batch.sampling_metadata
+
+        self.sampler.prepare_candidate_top_k(None)
+
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
+            if (
+               not get_ascend_config().enable_reduce_sample 
+               and sampling_metadata.top_k is not None
+               and not sampling_metadata.all_greedy
+               ):
+                top_k_cpu = self.input_batch.top_k_cpu[:self.input_batch.num_reqs]
+                vocab_size = self.input_batch.vocab_size
+
+                if (top_k_cpu.size > 0 and np.all(top_k_cpu > 0) and np.all(top_k_cpu < vocab_size)):
+                    self.sampler.prepare_candidate_top_k(top_k_cpu.max())
+                    
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,

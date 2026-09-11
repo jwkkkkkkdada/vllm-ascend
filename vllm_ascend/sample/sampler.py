@@ -85,6 +85,9 @@ class AscendSampler(Sampler):
     def prepare_sampling(self, top_k):
         self.topk_topp_sampler.prepare_sampling(top_k)
 
+    def prepare_candidate_top_k(self, max_top_k: int | None) -> None:
+        self.topk_topp_sampler.prepare_candidate_top_k(max_top_k)
+
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
         if get_ascend_config().enable_reduce_sample:
@@ -113,6 +116,7 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         super().__init__(**kwargs)
         self.apply_top_k_top_p = apply_top_k_top_p
         self.top_k = None
+        self._candidate_top_k: int | None = None
 
     def prepare_sampling(self, top_k):
         if top_k is not None:
@@ -120,10 +124,54 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         else:
             self.top_k = None
 
+    def prepare_candidate_top_k(self, max_top_k: int | None) -> None:
+        self._candidate_top_k = max_top_k
+
+
+    def _apply_candidate_top_k_top_p(
+            self,
+            logits: torch.Tensor,
+            k: torch.Tensor,
+            p:torch.Tensor | None,
+            max_top_k: int
+            ) -> torch.Tensor:
+        probs = logits.softmax(dim = -1)
+
+        candidate_probs = torch.topk(
+            probs,
+            k=max_top_k,
+            dim=-1,
+            sorted=True,
+        ).values
+
+        cutoff_index = k.to(torch.long).sub(1).unsqueeze(1)
+
+        if p is not None:
+            candidate_cumsum = candidate_probs.cumsum(dim=-1)
+            top_p_index = (candidate_cumsum < p.unsqueeze(1)).sum(dim=-1, keepdim=True)
+            top_p_index = torch.where(
+                p.unsqueeze(1) >= 1,
+                torch.full_like(top_p_index, max_top_k),
+                top_p_index
+            )
+            cutoff_index = torch.minimum(cutoff_index, top_p_index)
+
+        cutoff = candidate_probs.gather(
+            dim=-1,
+            index=cutoff_index,
+        )
+
+        logits.masked_fill_(probs < cutoff, -float("inf"))
+
+        return logits
+
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""
         # when batch_invariant mode is enabled, we should use vllm's implementation.
         # or it will make batch_invariant mode not working.
+        candidate_top_k = getattr(self, "_candidate_top_k", None)
+        self._candidate_top_k = None
+
         if envs.VLLM_BATCH_INVARIANT:
             logger.debug_once(
                 "[sample/sampler] BATCH_INVARIANT mode enabled, "
@@ -149,7 +197,13 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]
             return next_token, logits_to_return
         else:
-            logits = self.apply_top_k_top_p(logits, k, p)
+            if (k is not None and candidate_top_k is not None
+                and 0 < candidate_top_k < logits.shape[-1]):
+                logits = self._apply_candidate_top_k_top_p(
+                    logits, k, p, candidate_top_k,
+                )
+            else:
+                logits = self.apply_top_k_top_p(logits, k, p)
             logits_to_return = None
             if self.logprobs_mode == "processed_logits":
                 logits_to_return = logits
