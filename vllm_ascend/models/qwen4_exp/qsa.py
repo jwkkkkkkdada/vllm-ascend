@@ -21,25 +21,28 @@ from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 
 from vllm_ascend import envs
-from vllm_ascend.utils import is_950
-
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_fused_update_compressed_cache,
-    qsa_select_paged_tokens as qsa_select_paged_tokens_triton,
     qsa_sparse_paged_attention,
     qsa_store_cache_rows,
+    qsa_store_kv_cache_rows,
 )
+from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+    qsa_select_paged_tokens as qsa_select_paged_tokens_triton,
+)
+from vllm_ascend.utils import is_950
 
 from .common import qsa_cache
-from .lightning_indexer import qsa_select_paged_tokens_lightning
 from .common.qsa_cache import QSAForwardMetadata
+from .lightning_indexer import qsa_select_paged_tokens_lightning
 from .nvidia import indexer_qsa as upstream_indexer
 from .nvidia import qsa as upstream_qsa
 from .nvidia.ops.qsa_indexer_rope import qsa_merge_mrope_cos_sin
 from .ops import (
     qsa_select_paged_tokens as qsa_select_paged_tokens_reference,
+)
+from .ops import (
     qsa_sparse_paged_attention as qsa_sparse_paged_attention_reference,
-    reshape_and_cache_qsa,
 )
 
 QSAKVCache = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
@@ -405,12 +408,8 @@ class AscendQSAImpl:
         slot_mapping: torch.Tensor,
     ) -> None:
         del layer
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = _split_qsa_kv_cache(kv_cache, self.head_size)
-            qsa_store_cache_rows(key_cache, slot_mapping, key)
-            qsa_store_cache_rows(value_cache, slot_mapping, value)
-        else:
-            reshape_and_cache_qsa(key, value, kv_cache, slot_mapping, self.head_size)
+        key_cache, value_cache = _split_qsa_kv_cache(kv_cache, self.head_size)
+        qsa_store_kv_cache_rows(key_cache, value_cache, slot_mapping, key, value)
 
     def forward_qsa(
         self,
