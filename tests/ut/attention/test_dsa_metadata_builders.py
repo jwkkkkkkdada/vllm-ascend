@@ -2,7 +2,6 @@
 
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import Any
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -38,8 +37,6 @@ def make_builder(cls, ratio=0):
         compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)),
     )
     builder._device_metadata_enabled = False
-    builder._sas_variant_buffers = {}
-    builder._step_rope_buffers = {}
     builder.decode_threshold = 2
     builder.num_actual_tokens = 2
     builder.num_decodes, builder.num_prefills = 1, 0
@@ -63,7 +60,7 @@ def make_builder(cls, ratio=0):
     builder.common_ratio_to_sas_metadata = {}
     builder.metadata_cls = dsa_v1.AscendDSAMetadata
     builder._num_compressor_metadata_rows = Mock(return_value=2)
-    builder.set_num_actual_tokens = Mock()
+    builder.set_num_actual_tokens = lambda common: setattr(builder, "num_actual_tokens", common.num_actual_tokens)
     return builder
 
 
@@ -79,7 +76,7 @@ class TestDSAMetadataBuilders(TestCase):
             )
         )
         stack.enter_context(patch.object(dsa_v1, "_draft_uses_sparse_flash_mla", return_value=False))
-        self.builder = make_builder(dsa_v1.AscendDSASWAMetadataBuilder)
+        self.builder = make_builder(dsa_v1.AscendDSAMetadataBuilder)
         self.common = CommonMetadata(
             num_reqs=1,
             num_actual_tokens=2,
@@ -140,281 +137,184 @@ class TestDSAMetadataBuilders(TestCase):
                 ),
             )
         )
-        stack.enter_context(patch.object(dsa_v1, "split_decodes_and_prefills", return_value=(1, 0, 2, 0)))
-
-    def build_req(self, builder=None, **kwargs):
-        builder = builder or self.builder
-        return builder.build_req_metadata(
-            self.common,
-            self.common._seq_lens_cpu,
-            1,
-            None,
-            None,
-            **kwargs,
+        stack.enter_context(
+            patch.object(
+                dsa_v1,
+                "split_decodes_and_prefills",
+                side_effect=lambda common, **kwargs: (common.num_reqs, 0, common.num_actual_tokens, 0),
+            )
         )
 
-    def test_backend_selects_role_builder_in_both_modes(self):
-        roles = [
-            (dsa_v1.AscendDSAC4StateBackend, "State"),
-            (dsa_v1.AscendDSAC128StateBackend, "State"),
-            (dsa_v1.AscendDSASWABackend, "SWA"),
-            (dsa_v1.AscendDSAC4Backend, "Attention"),
-            (dsa_v1.AscendDSAC128Backend, "Attention"),
-            (dsa_v1.AscendDSAIndexerBackend, "Indexer"),
-        ]
-        for base, module, prefix in [
-            (dsa_v1.AscendDSAMetadataBuilder, dsa_v1, "AscendDSA"),
-            (dsa_cp.AscendDSAPCPMetadataBuilder, dsa_cp, "AscendDSAPCP"),
-        ]:
-            with patch.object(dsa_v1.AscendDSABackend, "get_builder_cls", return_value=base):
-                for backend, role in roles:
-                    cls = backend.get_builder_cls()
-                    self.assertIs(cls, getattr(module, f"{prefix}{role}MetadataBuilder"))
-                    builder = make_builder(cls)
-                    self.assertTrue(builder._use_specialized_metadata())
-                    self.assertEqual(builder._needs_sas, role in ("SWA", "Attention"))
-        with patch.object(dsa_v1.AscendDSABackend, "get_builder_cls", return_value=dsa_cp.AscendDSACPMetadataBuilder):
-            self.assertIs(dsa_v1.AscendDSASWABackend.get_builder_cls(), dsa_cp.AscendDSACPMetadataBuilder)
+    def build(self, builder, common, shared):
+        return builder.build(0, common, common_ratio_to_sas_metadata=shared)
 
-    def test_state_skips_query_and_compressor_preparation(self):
-        builder = make_builder(dsa_v1.AscendDSAStateMetadataBuilder, ratio=4)
-        result = builder.build(0, self.common, common_ratio_to_sas_metadata={})
-        self.assertIsNone(result.req_metadata.sas_metadata)
-        self.assertIsNone(result.req_metadata.qli_metadata)
-        self.assertIsNone(result.req_metadata.cos)
-        self.assertIsNone(result.req_metadata.start_pos)
-        self.rope_op.assert_not_called()
-        self.sas_op.assert_not_called()
-        self.qli_op.assert_not_called()
+    def test_non_pcp_shares_results_with_independent_output_buffers(self):
+        shared = {}
+        common = self.common.replace(causal=True)
+        builders = [make_builder(dsa_v1.AscendDSAMetadataBuilder, ratio=4) for _ in range(2)]
+        first, second = [self.build(builder, common, shared).req_metadata for builder in builders]
+        self.rope_op.assert_called_once()
+        self.sas_op.assert_called_once()
+        self.qli_op.assert_called_once()
+        for name in ("sas_metadata", "qli_metadata", "qli_seqused_k", "qli_cmp_residual_k", "start_pos"):
+            torch.testing.assert_close(getattr(first, name), getattr(second, name))
+            self.assertNotEqual(getattr(first, name).data_ptr(), getattr(second, name).data_ptr())
 
-    def test_state_zeros_padding_including_empty_rank(self):
-        for actual_reqs in (0, 1):
-            builder = make_builder(dsa_v1.AscendDSAStateMetadataBuilder, ratio=4)
-            common = self.common.replace(
-                num_reqs=2,
-                block_table_tensor=torch.ones((2, 2), dtype=torch.int32),
-                seq_lens=torch.tensor([6, 0], dtype=torch.int32),
-                query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32),
-            )
-            shared = {
-                "num_decodes": 2,
-                "num_prefills": 0,
-                "num_decode_tokens": 2,
-                "num_prefill_tokens": 0,
-                "seq_lens": common.seq_lens,
-            }
-            req = builder.build(
-                0,
-                common,
-                num_actual_reqs=actual_reqs,
-                common_ratio_to_sas_metadata=shared,
-            ).req_metadata
-            self.assertEqual(req.num_actual_reqs, actual_reqs)
-            self.assertTrue(torch.all(req.block_table[actual_reqs:] == 0))
-
-    def test_swa_dspark_keeps_indices_and_window(self):
-        req = self.build_req(update_cache=False)
-        self.assertIs(req.dspark_swa_indices, self.indices_op.return_value[0])
-        self.assertEqual((req.ori_win_left, req.ori_win_right), (5, 0))
-        self.assertEqual(self.sas_op.call_args.kwargs["ori_mask_mode"], 0)
-        self.assertIsNone(req.qli_metadata)
-        self.assertIsNone(req.start_pos)
-        self.assertIsNone(req.slot_mapping)
-        self.qli_op.assert_not_called()
-
-    def test_sparse_flash_draft_preserves_logical_indices_and_lengths(self):
-        self.builder.dspark_swa_topk_lengths_buffer = torch.zeros(8, dtype=torch.int32)
-        indices = torch.ones((2, 1, 8), dtype=torch.int32)
-        lengths = self.builder.dspark_swa_topk_lengths_buffer[:2]
-        self.indices_op.return_value = (indices, lengths)
-        with (
-            patch.object(dsa_v1, "_draft_uses_sparse_flash_mla", return_value=True),
-            patch.object(
-                self.builder,
-                "_build_dspark_sparse_flash_mla_metadata",
-                return_value=torch.full_like(self.builder.sas_metadata_buffer, 7),
-            ) as sparse,
-        ):
-            req = self.build_req()
-        self.assertIs(req.dspark_swa_indices, indices)
-        self.assertIs(req.dspark_swa_topk_lengths, lengths)
-        self.assertTrue(self.indices_op.call_args.kwargs["use_logical_indices"])
-        self.assertIs(sparse.call_args.kwargs["ori_topk_length"], lengths)
-        self.assertEqual(sparse.call_args.kwargs["ori_topk"], 8)
-        self.assertTrue(torch.all(req.sas_metadata == 7))
-        self.sas_op.assert_not_called()
-
-    def test_cache_only_skips_sparse_flash_preparation(self):
-        with (
-            patch.object(dsa_v1, "_draft_uses_sparse_flash_mla", return_value=True),
-            patch.object(self.builder, "_build_dspark_sparse_flash_mla_metadata") as sparse,
-        ):
-            req = self.build_req(build_query=False)
-        self.assertIsNone(req.sas_metadata)
-        self.assertIsNone(req.dspark_swa_indices)
-        sparse.assert_not_called()
-        self.indices_op.assert_not_called()
-
-    def test_causal_and_noncausal_sas_do_not_alias(self):
-        self.common.causal = True
-        causal = self.build_req()
-        self.common.causal = False
-        draft = self.build_req()
-        self.assertNotEqual(causal.sas_metadata.data_ptr(), draft.sas_metadata.data_ptr())
+    def test_sas_cache_separates_causal_and_dspark_groups(self):
+        shared = {}
+        builders = [make_builder(dsa_v1.AscendDSAMetadataBuilder) for _ in range(3)]
+        causal = self.build(builders[0], self.common.replace(causal=True), shared).req_metadata
+        draft = self.build(builders[1], self.common, shared).req_metadata
+        repeated = self.build(builders[2], self.common, shared).req_metadata
+        self.assertEqual(self.sas_op.call_count, 2)
         self.assertTrue(torch.all(causal.sas_metadata == 1))
         self.assertTrue(torch.all(draft.sas_metadata == 2))
-        self.assertEqual(self.sas_op.call_count, 2)
-
-    def test_sas_shared_but_physical_indices_are_per_group(self):
-        other = make_builder(dsa_v1.AscendDSASWAMetadataBuilder)
-        other.block_table = torch.tensor([[9, 10]], dtype=torch.int32)
-        other.common_ratio_to_sas_metadata = self.builder.common_ratio_to_sas_metadata
-        first = self.build_req()
-        second = self.build_req(other)
-        self.assertIs(first.sas_metadata, second.sas_metadata)
-        self.sas_op.assert_called_once()
+        torch.testing.assert_close(draft.sas_metadata, repeated.sas_metadata)
         self.assertEqual(self.indices_op.call_count, 2)
-        torch.testing.assert_close(self.indices_op.call_args.args[0], other.block_table)
 
-    def test_sas_recomputed_next_step_at_stable_address(self):
-        first = self.build_req()
-        self.builder.common_ratio_to_sas_metadata = {}
-        second = self.build_req()
-        self.assertIs(first.sas_metadata, second.sas_metadata)
+    def test_sas_cache_separates_windows(self):
+        shared = {}
+        self.build(self.builder, self.common, shared)
+        other = make_builder(dsa_v1.AscendDSAMetadataBuilder)
+        with patch.object(dsa_v1, "get_dspark_sparse_sas_window", return_value=(7, 0)):
+            self.build(other, self.common, shared)
         self.assertEqual(self.sas_op.call_count, 2)
+        self.assertEqual(self.sas_op.call_args.kwargs["ori_win_left"], 7)
 
-    def test_prefill_skips_dspark_decode_indices(self):
-        self.builder.num_prefills = 1
-        req = self.build_req()
-        self.assertIsNone(req.dspark_swa_indices)
-        self.assertEqual(req.ori_win_left, 3)
-        self.indices_op.assert_not_called()
+    def make_pcp_builder(self, global_common, local_common, *, sharded=False, full_graph=False):
+        builder = make_builder(dsa_cp.AscendDSAPCPMetadataBuilder, ratio=4)
+        builder._global_metadata_builder = make_builder(dsa_v1.AscendDSAMetadataBuilder, ratio=4)
+        builder._is_decode_sharded = sharded
+        builder._global_rope_buffers = {}
+        builder._hidden_restore_idx_buffer = torch.empty(8, dtype=torch.int64)
+        builder.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: full_graph
+        builder._prepare_graph_pcp_context = Mock(side_effect=lambda context, **kwargs: context)
+        builder._build_global_common_attn_metadata = Mock(return_value=global_common)
+        builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+        builder._build_local_common_attn_metadata = Mock(return_value=local_common)
+        return builder
 
-    def test_indexer_shares_qli_output_and_auxiliary_buffers(self):
-        first_builder = make_builder(dsa_v1.AscendDSAIndexerMetadataBuilder, ratio=4)
-        second_builder = make_builder(dsa_v1.AscendDSAIndexerMetadataBuilder, ratio=4)
-        second_builder.common_ratio_to_sas_metadata = first_builder.common_ratio_to_sas_metadata
-        first = self.build_req(first_builder, update_cache=False)
-        second = self.build_req(second_builder, update_cache=False)
-        self.assertIs(first.qli_metadata, second.qli_metadata)
-        self.assertIs(first.qli_seqused_k, second.qli_seqused_k)
-        self.assertIs(first.qli_cmp_residual_k, second.qli_cmp_residual_k)
-        torch.testing.assert_close(first.qli_seqused_k, torch.tensor([1], dtype=torch.int32))
-        torch.testing.assert_close(first.qli_cmp_residual_k, torch.tensor([2], dtype=torch.int32))
-        self.assertTrue(torch.all(second_builder.qli_seqused_k == -1))
-        self.qli_op.assert_called_once()
-        self.sas_op.assert_not_called()
-        self.indices_op.assert_not_called()
-
-    def test_compressed_attention_skips_qli_and_shares_start_positions(self):
-        first_builder = make_builder(dsa_v1.AscendDSAAttentionMetadataBuilder, ratio=4)
-        second_builder = make_builder(dsa_v1.AscendDSAAttentionMetadataBuilder, ratio=128)
-        second_builder.common_ratio_to_sas_metadata = first_builder.common_ratio_to_sas_metadata
-        first = self.build_req(first_builder, build_query=False)
-        second = self.build_req(second_builder, build_query=False)
-        self.assertIs(first.start_pos, second.start_pos)
-        torch.testing.assert_close(first.start_pos, torch.tensor([4], dtype=torch.int32))
-        self.assertEqual(first.num_compressed_tokens, 2)
-        self.assertIsNone(first.sas_metadata)
-        self.assertIsNone(first.qli_metadata)
-        self.indices_op.assert_not_called()
-        self.sas_op.assert_not_called()
-        self.qli_op.assert_not_called()
-
-    def test_compressed_query_builds_sas_only(self):
-        builder = make_builder(dsa_v1.AscendDSAAttentionMetadataBuilder, ratio=4)
-        self.common.causal = True
-        req = self.build_req(builder, update_cache=False)
-        self.assertIsNotNone(req.sas_metadata)
-        self.assertIsNone(req.qli_metadata)
-        self.assertIsNone(req.start_pos)
-        self.assertIsNone(req.num_compressed_tokens)
-        self.qli_op.assert_not_called()
-
-    def test_global_compressor_needs_neither_cpu_lengths_nor_query_limits(self):
-        builder = make_builder(dsa_v1.AscendDSAAttentionMetadataBuilder, ratio=4)
-        common = self.common.replace(_seq_lens_cpu=None, seq_lens_cpu=None, num_input_tokens=8)
-        req = builder.build(
-            0,
-            common,
-            common_ratio_to_sas_metadata={},
-            build_query=False,
-            full_graph_mode=True,
-        ).req_metadata
-        self.assertEqual(req.num_compressed_tokens, 3)
-        self.assertNotIn("seq_lens_cpu", builder.common_ratio_to_sas_metadata)
-        self.assertNotIn("req_preamble", builder.common_ratio_to_sas_metadata)
-        self.rope_op.assert_not_called()
-        self.sas_op.assert_not_called()
-        self.qli_op.assert_not_called()
-
-    def test_dspark_rope_is_staged_once_per_invocation(self):
-        other = make_builder(dsa_v1.AscendDSASWAMetadataBuilder)
-        proxy = Mock()
-        proxy.copy_to_buffers.return_value = (object(), object())
-        self.rope_op.return_value = (proxy, object())
-        shared: dict[Any, Any] = {}
-        results = []
-        for builder in (self.builder, other):
-            builder.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: True
-            results.append(
-                builder.build_for_cudagraph_capture(
-                    self.common,
-                    common_ratio_to_sas_metadata=shared,
-                    full_graph_mode=True,
-                )
+    def run_pcp_groups(self, *, prefill=True, sharded=False, full_graph=False, steps=1, empty_local=False):
+        # Exercise the real PCP build and ordinary DSA builders. Only PCP layout
+        # preparation and device operators are replaced with CPU fixtures.
+        global_common = self.common.replace(
+            causal=True,
+            seq_lens=torch.tensor([10], dtype=torch.int32),
+            _seq_lens_cpu=torch.tensor([10], dtype=torch.int32),
+            positions=torch.tensor([8, 9]),
+        )
+        local_common = self.common.replace(causal=True)
+        if empty_local:
+            local_common = local_common.replace(
+                num_actual_tokens=0,
+                num_input_tokens=0,
+                query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
+                query_start_loc_cpu=torch.tensor([0, 0], dtype=torch.int32),
             )
-        self.rope_op.assert_called_once()
-        self.assertFalse(self.rope_op.call_args.kwargs["use_cache"])
-        proxy.copy_to_buffers.assert_called_once()
-        self.assertIs(results[0].req_metadata.cos, results[1].req_metadata.cos)
-
-    def test_device_metadata_and_vision_keep_full_builder(self):
-        self.builder._device_metadata_enabled = True
-        self.assertFalse(self.builder._use_specialized_metadata())
-        self.builder._device_metadata_enabled = False
-        self.builder.model_config.hf_config.vision_n_layers = 1
-        self.assertFalse(self.builder._use_specialized_metadata())
-        self.builder.model_config.hf_config.vision_n_layers = 0
-        self.builder.vllm_config.use_v2_model_runner = False
-        self.assertFalse(self.builder._use_specialized_metadata())
-
-    def test_pcp_shares_preparation_but_preserves_group_addresses(self):
-        shared: dict[Any, Any] = {}
+        builders = [
+            self.make_pcp_builder(
+                global_common.replace(
+                    block_table_tensor=torch.tensor([[10 + group, 20 + group]], dtype=torch.int32),
+                    slot_mapping=torch.tensor([40 + group, 80 + group], dtype=torch.int32),
+                ),
+                local_common.replace(block_table_tensor=torch.tensor([[30 + group, 40 + group]], dtype=torch.int32)),
+                sharded=sharded,
+                full_graph=full_graph,
+            )
+            for group in range(2)
+        ]
         context = SimpleNamespace(
-            global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([True]), num_reqs=1),
-            global_block_tables=[torch.tensor([[10]]), torch.tensor([[20]])],
-            global_slot_mappings=[torch.tensor([1, 2]), torch.tensor([3, 4])],
+            global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([prefill]), num_reqs=1),
             hidden_restore_idx=torch.tensor([0, 1]),
         )
-        builders = []
-        for cls in (dsa_cp.AscendDSAPCPStateMetadataBuilder, dsa_cp.AscendDSAPCPSWAMetadataBuilder):
-            builder = make_builder(cls)
-            builder._is_decode_sharded = False
-            builder._prepare_graph_pcp_context = Mock(return_value=context)
-            builder._build_global_common_attn_metadata = Mock(return_value=self.common)
-            builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
-            builder._build_local_common_attn_metadata = Mock(return_value=self.common)
-            builder._build_local_dsa_metadata = Mock(return_value=SimpleNamespace())
-            builder._global_metadata_builder = SimpleNamespace(build=Mock(return_value=SimpleNamespace()))
-            builders.append(builder)
-        with patch.object(dsa_cp.AscendDSAPCPMetadata, "from_local_metadata"):
-            for index, builder in enumerate(builders):
-                builder.build(
-                    0,
-                    self.common,
-                    pcp_context=context,
-                    pcp_cache_group_idx=index,
-                    num_actual_reqs=1,
-                    common_ratio_to_sas_metadata=shared,
+        runs = []
+        for step in range(steps):
+            shared = {}
+            outputs = []
+            for group, builder in enumerate(builders):
+                outputs.append(
+                    builder.build(
+                        0,
+                        local_common,
+                        pcp_context=context,
+                        pcp_cache_group_idx=group,
+                        num_actual_reqs=1,
+                        common_ratio_to_sas_metadata=shared,
+                        full_graph_mode=full_graph,
+                    )
                 )
-        builders[0]._prepare_graph_pcp_context.assert_called_once()
-        builders[1]._prepare_graph_pcp_context.assert_not_called()
-        builders[1]._build_graph_common_attn_metadata.assert_not_called()
-        for index, builder in enumerate(builders):
-            call = builder._global_metadata_builder.build.call_args
-            self.assertIs(call.args[1].block_table_tensor, context.global_block_tables[index])
-            self.assertIs(call.args[1].slot_mapping, context.global_slot_mappings[index])
-            self.assertIs(call.kwargs["common_ratio_to_sas_metadata"], shared["pcp_global"])
-            self.assertFalse(call.kwargs["build_query"])
-            self.assertFalse(builder._build_local_dsa_metadata.call_args.kwargs["update_cache"])
+                # MRV2 carries this attribute forward to the next cache group.
+                self.assertIs(builder.common_ratio_to_sas_metadata, shared)
+                shared = builder.common_ratio_to_sas_metadata
+            runs.append((shared, outputs))
+        return builders, runs
+
+    def test_pcp_shares_global_results_and_isolates_local_layout(self):
+        for prefill, sharded in ((True, False), (False, True)):
+            with self.subTest(prefill=prefill, sharded=sharded):
+                self.sas_op.reset_mock()
+                self.qli_op.reset_mock()
+                self.rope_op.reset_mock()
+                builders, runs = self.run_pcp_groups(prefill=prefill, sharded=sharded)
+                shared, outputs = runs[0]
+                self.assertEqual(self.sas_op.call_count, 2)
+                self.assertEqual(self.qli_op.call_count, 2)
+                self.assertEqual(self.rope_op.call_count, 2)
+                self.assertIsNot(shared["pcp_global"], shared["pcp_local"])
+                for group, output in enumerate(outputs):
+                    global_req = output.global_dsa_metadata.req_metadata
+                    local_req = output.req_metadata
+                    torch.testing.assert_close(global_req.seq_lens, torch.tensor([10], dtype=torch.int32))
+                    torch.testing.assert_close(local_req.seq_lens, torch.tensor([6], dtype=torch.int32))
+                    self.assertEqual(global_req.block_table[0, 0].item(), 10 + group)
+                    self.assertEqual(local_req.block_table[0, 0].item(), 30 + group)
+                    torch.testing.assert_close(global_req.qli_seqused_k, torch.tensor([2], dtype=torch.int32))
+                    torch.testing.assert_close(local_req.qli_seqused_k, torch.tensor([1], dtype=torch.int32))
+                    self.assertIs(
+                        builders[group]._global_metadata_builder.common_ratio_to_sas_metadata, shared["pcp_global"]
+                    )
+                first, second = [output.global_dsa_metadata.req_metadata for output in outputs]
+                self.assertNotEqual(first.sas_metadata.data_ptr(), second.sas_metadata.data_ptr())
+
+    def test_pcp_recomputes_results_each_invocation(self):
+        _, runs = self.run_pcp_groups(steps=2)
+        self.assertEqual(self.sas_op.call_count, 4)
+        self.assertEqual(self.qli_op.call_count, 4)
+        self.assertEqual(self.rope_op.call_count, 4)
+        self.assertIsNot(runs[0][0]["pcp_global"], runs[1][0]["pcp_global"])
+        self.assertIsNot(runs[0][0]["pcp_local"], runs[1][0]["pcp_local"])
+
+    def test_replicated_decode_uses_only_local_metadata(self):
+        builders, runs = self.run_pcp_groups(prefill=False)
+        shared, outputs = runs[0]
+        self.assertEqual(shared["pcp_global"], {})
+        self.assertTrue(all(type(output) is dsa_v1.AscendDSAMetadata for output in outputs))
+        for builder in builders:
+            builder._build_global_common_attn_metadata.assert_not_called()
+        self.sas_op.assert_called_once()
+        self.qli_op.assert_called_once()
+        self.rope_op.assert_called_once()
+
+    def test_empty_local_rank_still_shares_global_metadata(self):
+        _, runs = self.run_pcp_groups(empty_local=True)
+        shared, outputs = runs[0]
+        self.assertEqual(shared["pcp_local"], {})
+        self.assertTrue(all(output.req_metadata is None for output in outputs))
+        self.sas_op.assert_called_once()
+        self.qli_op.assert_called_once()
+
+    def test_sharded_graph_keeps_per_builder_rope_buffers(self):
+        proxy = Mock()
+        proxy.copy_to_buffers.side_effect = lambda buffers, size: buffers.setdefault(
+            "rope", (torch.ones(size), torch.zeros(size))
+        )
+        self.rope_op.return_value = (proxy, object())
+        builders, runs = self.run_pcp_groups(prefill=False, sharded=True, full_graph=True)
+        self.assertEqual(proxy.copy_to_buffers.call_count, 2)
+        outputs = runs[0][1]
+        for builder, output in zip(builders, outputs):
+            self.assertIs(output.global_dsa_metadata.req_metadata.cos, builder._global_rope_buffers["rope"][0])
+        self.assertNotEqual(
+            outputs[0].global_dsa_metadata.req_metadata.cos.data_ptr(),
+            outputs[1].global_dsa_metadata.req_metadata.cos.data_ptr(),
+        )

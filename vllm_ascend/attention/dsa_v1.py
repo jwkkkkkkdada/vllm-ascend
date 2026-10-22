@@ -347,10 +347,6 @@ class AscendDSABackend(AttentionBackend):
 
 class AscendDSAC4Backend(AscendDSABackend):
     @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("Attention")
-
-    @staticmethod
     def get_name() -> str:
         return "ASCEND_DSA_C4"
 
@@ -372,10 +368,6 @@ class AscendDSAC4Backend(AscendDSABackend):
 
 
 class AscendDSAC128Backend(AscendDSABackend):
-    @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("Attention")
-
     @staticmethod
     def get_name() -> str:
         return "ASCEND_DSA_C128"
@@ -399,10 +391,6 @@ class AscendDSAC128Backend(AscendDSABackend):
 
 class AscendDSASWABackend(AscendDSABackend):
     @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("SWA")
-
-    @staticmethod
     def get_name() -> str:
         return "ASCEND_DSA_SWA"
 
@@ -420,10 +408,6 @@ class AscendDSASWABackend(AscendDSABackend):
 
 
 class AscendDSAC4StateBackend(AscendDSABackend):
-    @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("State")
-
     @staticmethod
     def get_name() -> str:
         return "ASCEND_DSA_C4_STATE"
@@ -443,10 +427,6 @@ class AscendDSAC4StateBackend(AscendDSABackend):
 
 class AscendDSAC128StateBackend(AscendDSABackend):
     @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("State")
-
-    @staticmethod
     def get_name() -> str:
         return "ASCEND_DSA_C128_STATE"
 
@@ -465,40 +445,6 @@ class AscendDSAC128StateBackend(AscendDSABackend):
             if get_current_hardware_profile().supports(HardwareCapability.DSA_C128_STATE_SMALL_BLOCK_SIZES):
                 return [4, 8, 16]
             return [8, 16, 32]
-
-
-class AscendDSAIndexerBackend(AscendDSAC4Backend):
-    """Separate indexer consumers from compressed attention cache groups."""
-
-    @staticmethod
-    def get_name() -> str:
-        return "ASCEND_DSA_INDEXER"
-
-    @staticmethod
-    def get_builder_cls():
-        return _get_dsa_role_builder("Indexer")
-
-
-def _get_dsa_role_builder(role: str):
-    # Backend discovery can run before model modules finish importing.
-    builder_cls = AscendDSABackend.get_builder_cls()
-    if builder_cls is AscendDSAMetadataBuilder:
-        return {
-            "State": AscendDSAStateMetadataBuilder,
-            "SWA": AscendDSASWAMetadataBuilder,
-            "Attention": AscendDSAAttentionMetadataBuilder,
-            "Indexer": AscendDSAIndexerMetadataBuilder,
-        }[role]
-    from vllm_ascend.attention.context_parallel import dsa_cp
-
-    if builder_cls is dsa_cp.AscendDSAPCPMetadataBuilder:
-        return {
-            "State": dsa_cp.AscendDSAPCPStateMetadataBuilder,
-            "SWA": dsa_cp.AscendDSAPCPSWAMetadataBuilder,
-            "Attention": dsa_cp.AscendDSAPCPAttentionMetadataBuilder,
-            "Indexer": dsa_cp.AscendDSAPCPIndexerMetadataBuilder,
-        }[role]
-    return builder_cls
 
 
 @dataclass
@@ -799,21 +745,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     """
 
     _request_capacity_factor: ClassVar[int] = 1
-    _specialized_metadata: ClassVar[bool] = False
-    _state_only: ClassVar[bool] = False
-    _needs_sas: ClassVar[bool] = True
-    _needs_qli: ClassVar[bool] = True
-
-    def _use_specialized_metadata(self) -> bool:
-        # MRV2 shares the cache during both capture and replay. MRV1 creates
-        # separate caches during capture, so it must keep per-builder outputs.
-        # Deferred device tasks also keep their existing ownership.
-        return (
-            self._specialized_metadata
-            and self.vllm_config.use_v2_model_runner
-            and not self._device_metadata_enabled
-            and not getattr(self.model_config.hf_config, "vision_n_layers", 0)
-        )
 
     def __init__(
         self,
@@ -829,9 +760,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
-        self._sas_variant_buffers: dict = {}
-        # DSpark target and draft builders must not overwrite module-global RoPE.
-        self._step_rope_buffers: dict = {}
         self.logical_block_size = kv_cache_spec.block_size
         self.storage_block_size = get_storage_block_size(kv_cache_spec)
         scheduler_config = vllm_config.scheduler_config
@@ -1069,19 +997,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         *,
         can_use_rope_cache: bool = True,
         full_graph_mode: bool = False,
-        build_query: bool = True,
-        update_cache: bool = True,
         **kwargs,
     ) -> AscendDSAMetadata:
-        specialized = self._use_specialized_metadata()
-        if not specialized:
-            build_query = update_cache = True
         num_reqs = common_attn_metadata.num_reqs
         num_actual_reqs = kwargs.get("num_actual_reqs")
         self.common_ratio_to_sas_metadata = kwargs.get("common_ratio_to_sas_metadata")
         assert self.common_ratio_to_sas_metadata is not None
         self.set_num_actual_tokens(common_attn_metadata)
-        assert self.num_actual_tokens is not None
         num_input_tokens = common_attn_metadata.num_input_tokens
 
         if self.common_ratio_to_sas_metadata.get("num_decodes") is None:
@@ -1099,6 +1021,27 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
             self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
             self.common_ratio_to_sas_metadata["seq_lens"] = self.seq_lens
+            # Prefer _seq_lens_cpu (always available, updated during draft
+            # iterations) over seq_lens_cpu (None in async spec decode mode).
+            if common_attn_metadata._seq_lens_cpu is not None:
+                seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            elif common_attn_metadata.seq_lens_cpu is not None:
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            else:
+                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+            self.common_ratio_to_sas_metadata["seq_lens_cpu"] = seq_lens_cpu
+            # FULL graphs replay fixed shapes, so cos/sin must span the padded
+            # token count. Other modes consume only real tokens; build at the
+            # actual length so consumers never need to re-slice.
+            num_position_tokens = num_input_tokens if full_graph_mode else common_attn_metadata.num_actual_tokens
+            input_positions = common_attn_metadata.positions[:num_position_tokens].long()
+            need_use_rope_cache = can_use_rope_cache and self.num_prefills == 0
+            cos, sin = get_cos_and_sin_dsa(
+                input_positions,
+                use_cache=need_use_rope_cache,
+            )
+            self.common_ratio_to_sas_metadata["cos"] = cos
+            self.common_ratio_to_sas_metadata["sin"] = sin
         else:
             self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
                 self.common_ratio_to_sas_metadata["num_decodes"],
@@ -1107,68 +1050,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.common_ratio_to_sas_metadata["num_prefill_tokens"],
             )
             self.seq_lens = self.common_ratio_to_sas_metadata["seq_lens"]
-
-        cache = self.common_ratio_to_sas_metadata
-        self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
-        if specialized and self._state_only:
-            actual_reqs = num_reqs if num_actual_reqs is None else min(num_actual_reqs, num_reqs)
-            self.block_table[actual_reqs:].zero_()
-            self._device_metadata_tasks = ()
-            req = AscendDSAReqMetadata(
-                block_table=self.block_table,
-                seq_lens=self.seq_lens,
-                slot_mapping=None,
-                storage_block_size=self.storage_block_size,
-                query_start_loc=common_attn_metadata.query_start_loc[: num_reqs + 1],
-                num_actual_reqs=actual_reqs,
-                cache_group_key=self.cache_group_key,
-            )
-            return self.metadata_cls(
-                num_actual_tokens=self.num_actual_tokens,
-                head_dim=self.model_config.get_head_size(),
-                num_decodes=self.num_decodes,
-                num_decode_tokens=self.num_decode_tokens,
-                num_prefills=self.num_prefills,
-                attn_state=common_attn_metadata.attn_state,
-                req_metadata=req,
-                hadamard=self.hadamard,
-            )
-
-        seq_lens_cpu = None
-        if build_query:
-            seq_lens_cpu = cache.get("seq_lens_cpu")
-            if seq_lens_cpu is None:
-                seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-                if seq_lens_cpu is None:
-                    seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-                if seq_lens_cpu is None:
-                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
-                cache["seq_lens_cpu"] = seq_lens_cpu
-        cos = sin = None
-        if build_query or (update_cache and self.compressor_ratio <= 1):
-            if "cos" not in cache:
-                num_position_tokens = num_input_tokens if full_graph_mode else common_attn_metadata.num_actual_tokens
-                input_positions = common_attn_metadata.positions[:num_position_tokens].long()
-                is_dspark = (
-                    specialized and self.speculative_config is not None and self.speculative_config.method == "dspark"
-                )
-                cos, sin = get_cos_and_sin_dsa(
-                    input_positions,
-                    use_cache=can_use_rope_cache and self.num_prefills == 0 and not is_dspark,
-                )
-                if (
-                    is_dspark
-                    and can_use_rope_cache
-                    and self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
-                ):
-                    cos, sin = cos.copy_to_buffers(self._step_rope_buffers, self.slot_mapping.shape[0])
-                cache["cos"], cache["sin"] = cos, sin
-            cos, sin = cache["cos"], cache["sin"]
+            seq_lens_cpu = self.common_ratio_to_sas_metadata["seq_lens_cpu"]
+            cos = self.common_ratio_to_sas_metadata["cos"]
+            sin = self.common_ratio_to_sas_metadata["sin"]
 
         # CommonAttentionMetadata uses logical raw-token slots. They directly
         # describe only uncompressed SWA/state caches; C4/C128 physical slots
         # are generated later from the logical block table by compressor_metadata.
-        if update_cache and self.compressor_ratio <= 1:
+        if self.compressor_ratio <= 1:
             formatted_slots = kwargs.get("formatted_slot_mapping")
             if formatted_slots is None:
                 slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
@@ -1185,8 +1074,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos=cos,
             sin=sin,
             full_graph_mode=full_graph_mode,
-            build_query=build_query,
-            update_cache=update_cache,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -1217,12 +1104,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # DSpark widens the SWA window to include the whole draft block.
         # Metadata and execution must use the same window so split-G cores
         # agree on the number of KV iterations and synchronization events.
-        # These values change attention semantics even for the same ratio.
         key = ("sas", layer_name, ori_win_left, ori_win_right, dspark_swa)
-        specialized = self._use_specialized_metadata()
-        output_key = ("sas_output", key)
-        if specialized and output_key in metadata_cache:
-            return metadata_cache[output_key]
         sas_metadata = metadata_cache.get(key)
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
@@ -1271,17 +1153,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             metadata_cache[key] = sas_metadata
 
-        output = self.sas_metadata_buffer
-        if specialized:
-            # A single builder can encounter both causal and DSpark groups.
-            # Each variant needs its own capture-stable output address.
-            if key not in self._sas_variant_buffers:
-                self._sas_variant_buffers[key] = torch.empty_like(output)
-            output = self._sas_variant_buffers[key]
-        output[:DSA_METADATA_BUFFER_SIZE] = sas_metadata
-        if specialized:
-            metadata_cache[output_key] = output
-        return output
+        self.sas_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = sas_metadata
+        return self.sas_metadata_buffer
 
     def _build_dspark_sparse_flash_mla_metadata(
         self,
@@ -1324,10 +1197,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_q: int,
         max_seqlen_kv: int,
     ) -> torch.Tensor:
-        specialized = self._use_specialized_metadata()
-        if specialized and "qli_output" in metadata_cache:
-            return metadata_cache["qli_output"][0]
-        # Share the tiling output AND its length/residual buffers for this batch.
+        # Each cache-group builder owns these buffers, even when the QLI tiling
+        # metadata is shared. Refresh them in place for every builder and step.
         seq_lens_i32 = seq_lens
         if seq_lens_i32.dtype != torch.int32:
             seq_lens_i32 = seq_lens_i32.to(torch.int32)
@@ -1360,8 +1231,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             metadata_cache["qli"] = qli_metadata
 
         self.qli_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = qli_metadata
-        if specialized:
-            metadata_cache["qli_output"] = (self.qli_metadata_buffer, qli_seqused_k, qli_cmp_residual_k)
         return self.qli_metadata_buffer
 
     def enable_device_metadata(self) -> None:
@@ -1496,74 +1365,62 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     def build_req_metadata(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
-        seq_lens_cpu: torch.Tensor | None,
+        seq_lens_cpu: torch.Tensor,
         num_actual_reqs: int | None,
-        cos: torch.Tensor | None,
-        sin: torch.Tensor | None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         full_graph_mode: bool = False,
-        build_query: bool = True,
-        update_cache: bool = True,
     ) -> AscendDSAReqMetadata:
         assert self.common_ratio_to_sas_metadata is not None
         metadata_cache = self.common_ratio_to_sas_metadata
         assert self.num_actual_tokens is not None
-        specialized = self._use_specialized_metadata()
-        needs_sas = build_query and (not specialized or self._needs_sas)
-        needs_qli = build_query and self.compressor_ratio == 4 and (not specialized or self._needs_qli)
-        needs_start_pos = not specialized or (update_cache and self.compressor_ratio > 1)
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         seq_lens = self.seq_lens[:num_reqs]
-        max_seqlen_q = max_seqlen_kv = 0
-        if needs_sas or needs_qli:
-            # build() runs once per (kv_cache_group, attn_group) pair, but
-            # build_attn_metadata hands every pair the same query_start_loc /
-            # seq_lens objects -- only block_table, slot_mapping and causal vary by
-            # group. The length limits are group-invariant: compute them on the first
-            # group of the step and share them like seq_lens / cos / sin above.
-            # Keyed separately from the num_decodes gate in build() so a caller that
-            # populates this dict itself still gets the sharing.
-            assert seq_lens_cpu is not None
-            preamble = metadata_cache.get("req_preamble")
-            if preamble is None:
-                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-                max_seqlen_q = torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()
-                if (
-                    self.speculative_config is not None
-                    and getattr(self.speculative_config, "method", None) == "dspark"
-                    and getattr(self.speculative_config, "enable_adaptive_verification", False)
-                    and self.num_prefills == 0
-                ):
-                    # `query_start_loc_cpu` retains a layout with tokens evenly distributed across requests.
-                    # Longer query will typically appear after reallocation, recorded in `query_start_loc`.
-                    # So use the upper bound `num_speculative_tokens + 1` as `max_seqlen_q`.
-                    max_seqlen_q = max(max_seqlen_q, self.speculative_config.num_speculative_tokens + 1)
-                preamble = (
-                    max_seqlen_q,
-                    torch.max(seq_lens_cpu[:num_reqs]).item(),
-                )
-                metadata_cache["req_preamble"] = preamble
-            max_seqlen_q, max_seqlen_kv = preamble
+        # build() runs once per (kv_cache_group, attn_group) pair, but
+        # build_attn_metadata hands every pair the same query_start_loc /
+        # seq_lens objects -- only block_table, slot_mapping and causal vary by
+        # group. So these three are group-invariant: compute them on the first
+        # group of the step and share them like seq_lens / cos / sin above.
+        # Keyed separately from the num_decodes gate in build() so a caller that
+        # populates this dict itself still gets the sharing.
+        preamble = metadata_cache.get("req_preamble")
+        if preamble is None:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+            seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
+            max_seqlen_q = torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()
+            if (
+                self.speculative_config is not None
+                and getattr(self.speculative_config, "method", None) == "dspark"
+                and getattr(self.speculative_config, "enable_adaptive_verification", False)
+                and self.num_prefills == 0
+            ):
+                # `query_start_loc_cpu` retains a layout with tokens evenly distributed across requests.
+                # Longer query will typically appear after reallocation, recorded in `query_start_loc`.
+                # So use the upper bound `num_speculative_tokens + 1` as `max_seqlen_q`.
+                max_seqlen_q = max(max_seqlen_q, self.speculative_config.num_speculative_tokens + 1)
+            preamble = (
+                max_seqlen_q,
+                torch.max(seq_lens_cpu[:num_reqs]).item(),
+                seq_lens - seq_lens_q,
+            )
+            metadata_cache["req_preamble"] = preamble
+        max_seqlen_q, max_seqlen_kv, start_pos = preamble
         has_prefill = self.num_prefills > 0
 
-        actual_reqs = num_reqs if num_actual_reqs is None else min(num_actual_reqs, num_reqs)
-        num_actual_reqs = actual_reqs
-        if actual_reqs < num_reqs:
-            self.block_table[actual_reqs:num_reqs, ...].zero_()
-        start_pos = None
-        if needs_start_pos:
-            start_key = ("start_pos", actual_reqs)
-            start_pos = metadata_cache.get(start_key) if specialized else None
-            if start_pos is None:
-                start_values = metadata_cache.get("start_pos_values")
-                if start_values is None:
-                    start_values = seq_lens - (query_start_loc[1:] - query_start_loc[:-1])
-                    metadata_cache["start_pos_values"] = start_values
-                self.start_pos_prefill[:num_reqs].copy_(start_values)
-                self.start_pos_prefill[actual_reqs:].zero_()
-                start_pos = self.start_pos_prefill[:num_reqs]
-                if specialized:
-                    metadata_cache[start_key] = start_pos
+        # start_pos_prefill is a per-builder buffer with a capture-stable
+        # address, so the shared start_pos is copied in rather than aliased.
+        # Only the tail past num_reqs needs zeroing; [:num_reqs] is overwritten.
+        self.start_pos_prefill[:num_reqs].copy_(start_pos)
+        if num_reqs < self.start_pos_prefill.shape[0]:
+            self.start_pos_prefill[num_reqs:].fill_(0)
+        if num_actual_reqs is None:
+            num_actual_reqs = num_reqs
+        else:
+            num_actual_reqs = min(num_actual_reqs, num_reqs)
+            if num_actual_reqs < num_reqs:
+                self.start_pos_prefill[num_actual_reqs:num_reqs].fill_(0)
+                self.block_table[num_actual_reqs:num_reqs, ...].fill_(0)
         layer_name = f"c{self.compressor_ratio}"
         cu_seqlens_ori_kv = None
         cu_seqlens_cmp_kv = None
@@ -1572,15 +1429,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         vision_swa_indices = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
         use_sparse_flash = (
-            needs_sas
-            and not has_prefill
+            not has_prefill
             and not common_attn_metadata.causal
             and self.compressor_ratio <= 1
             and _draft_uses_sparse_flash_mla(self.vllm_config)
         )
         if (
-            needs_sas
-            and not has_prefill
+            not has_prefill
             and not common_attn_metadata.causal
             and (self.compressor_ratio <= 1 or not is_turboquant(self.vllm_config))
         ):
@@ -1652,7 +1507,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 mm_prefix_ranges=mm_ranges,
                 num_tokens=self.num_actual_tokens,
             )
-        if needs_sas and not has_prefill and not use_sparse_flash:
+        sas_key = ("sas", layer_name, ori_win_left, ori_win_right, dspark_swa_indices is not None)
+        if not has_prefill and not use_sparse_flash and metadata_cache.get(sas_key) is None:
             cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
                 self.common_ratio_to_sas_metadata,
                 "cu_seqlens_ori_kv",
@@ -1662,7 +1518,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.cu_seqlens_ori_kv,
             )
             cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
-        elif needs_sas and has_prefill:
+        elif has_prefill:
             cu_seqlens_ori_kv = query_start_loc
 
         def build_sas_metadata() -> torch.Tensor:
@@ -1717,7 +1573,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata = self.qli_metadata_buffer if self.compressor_ratio == 4 else None
         else:
             self._device_metadata_tasks = ()
-            sas_metadata = build_sas_metadata() if needs_sas else None
+            sas_metadata = build_sas_metadata()
             qli_metadata = (
                 self._build_qli_metadata(
                     metadata_cache=metadata_cache,
@@ -1726,14 +1582,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_kv=max_seqlen_kv,
                 )
-                if needs_qli
+                if self.compressor_ratio == 4
                 else None
             )
 
         full_compress_cos, full_compress_sin = None, None
-        num_compressed_tokens = None
-        slot_mapping = None
-        if update_cache and self.compressor_ratio > 1:
+        if self.compressor_ratio > 1:
             if full_graph_mode:
                 num_tokens = common_attn_metadata.num_input_tokens
                 num_compressed_tokens = min(num_tokens, num_tokens // self.compressor_ratio + num_reqs)
@@ -1742,23 +1596,20 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_compressed_tokens = self._num_compressor_metadata_rows(num_reqs)
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             slot_mapping = None
-        elif update_cache:
+        else:
             num_compressed_tokens = self.num_actual_tokens
             slot_mapping = self.slot_mapping[: self.num_actual_tokens]
 
         qli_cu_seqlens_q = None
         qli_seqused_k = None
         qli_cmp_residual_k = None
-        if needs_qli:
+        if self.compressor_ratio == 4:
             # QLI v2 PA_BBND reads the compressed K length plus the residual
             # from the original length; the persistent builder buffers are
             # refreshed in _build_qli_metadata.
             qli_cu_seqlens_q = query_start_loc
-            if specialized:
-                _, qli_seqused_k, qli_cmp_residual_k = metadata_cache["qli_output"]
-            else:
-                qli_seqused_k = self.qli_seqused_k[:num_reqs]
-                qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs]
+            qli_seqused_k = self.qli_seqused_k[:num_reqs]
+            qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs]
 
         req_metadata = AscendDSAReqMetadata(
             block_table=self.block_table[:num_reqs, ...],
@@ -1771,7 +1622,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos=cos,
             full_compress_sin=full_compress_sin,
             full_compress_cos=full_compress_cos,
-            start_pos=start_pos,
+            start_pos=self.start_pos_prefill[:num_reqs],
             num_actual_reqs=num_actual_reqs,
             cache_group_key=self.cache_group_key,
             sas_metadata=sas_metadata,
@@ -2109,36 +1960,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert attn_metadata is not None
         attn_metadata.attn_state = attn_state
         return attn_metadata
-
-
-class AscendDSAStateMetadataBuilder(AscendDSAMetadataBuilder):
-    """State cache consumers need only request layout and physical blocks."""
-
-    _specialized_metadata = True
-    _state_only = True
-    _needs_sas = False
-    _needs_qli = False
-
-
-class AscendDSASWAMetadataBuilder(AscendDSAMetadataBuilder):
-    """SWA queries use SAS and ordinary KV writes, never QLI."""
-
-    _specialized_metadata = True
-    _needs_qli = False
-
-
-class AscendDSAAttentionMetadataBuilder(AscendDSAMetadataBuilder):
-    """Compressed attention queries use SAS; cache writes use the compressor."""
-
-    _specialized_metadata = True
-    _needs_qli = False
-
-
-class AscendDSAIndexerMetadataBuilder(AscendDSAMetadataBuilder):
-    """Indexer queries use QLI, independently of attention SAS metadata."""
-
-    _specialized_metadata = True
-    _needs_sas = False
 
 
 class AscendDSAImpl(AttentionImplBase[Any]):
